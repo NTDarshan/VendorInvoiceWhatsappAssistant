@@ -1,7 +1,3 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using VendorInvoiceAssistant.Models;
 using VendorInvoiceAssistant.Services;
@@ -14,24 +10,22 @@ namespace VendorInvoiceAssistant.Controllers
     [Produces("application/json")]
     public class ChatController : ControllerBase
     {
-        private readonly ChatService _chatService;
+        private readonly VendorAgentService _agent;
 
-        public ChatController(ChatService chatService)
+        public ChatController(VendorAgentService agent)
         {
-            _chatService = chatService;
+            _agent = agent;
         }
 
         /// <summary>Send a message and receive an AI-generated response about vendor invoices.</summary>
-        /// <param name="request">The chat request containing the user's message.</param>
-        /// <returns>The AI-generated response string.</returns>
+        /// <param name="request">The chat request containing the vendor's phone number and message.</param>
         [HttpPost]
-        [ProducesResponseType(typeof(string), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(AgentResponse), StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         public async Task<IActionResult> Chat([FromBody] ChatRequest request)
         {
-            var answer = await _chatService.HandleAsync(request);
-
-            return Ok(answer);
+            var response = await _agent.RespondAsync(request.PhoneNumber, request.Message, request.PhoneNumber);
+            return Ok(response);
         }
     }
 }

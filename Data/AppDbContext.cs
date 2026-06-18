@@ -8,7 +8,6 @@ namespace VendorInvoiceAssistant.Data
 
         public DbSet<Vendor> Vendors => Set<Vendor>();
         public DbSet<Invoice> Invoices => Set<Invoice>();
-        public DbSet<ConversationContext> ConversationContexts => Set<ConversationContext>();
         public DbSet<InvoiceApproval> InvoiceApprovals => Set<InvoiceApproval>();
         public DbSet<VendorConversation> VendorConversations => Set<VendorConversation>();
 

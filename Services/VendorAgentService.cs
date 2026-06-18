@@ -2,16 +2,16 @@ using System.Text;
 using System.Text.Json;
 using Azure;
 using Azure.AI.OpenAI;
+using Microsoft.Extensions.Caching.Memory;
 using OpenAI.Chat;
 using VendorInvoiceAssistant.Data;
+using VendorInvoiceAssistant.Models;
 
 namespace VendorInvoiceAssistant.Services
 {
     /// <summary>
-    /// The natural-language brain of the assistant. Instead of hard-coded intent branches, it
-    /// gives the model (a) a snapshot of every invoice the vendor owns, (b) recent conversation
-    /// history, and (c) a set of tools it can call. The model decides whether to answer directly,
-    /// ask a clarifying question, handle multiple intents, or escalate to a human (HIL).
+    /// Single entry point for all vendor messages. The model decides whether to answer
+    /// directly, call a tool, show the menu, ask for clarification, or escalate to a human.
     /// </summary>
     public class VendorAgentService
     {
@@ -19,20 +19,31 @@ namespace VendorInvoiceAssistant.Services
         private readonly InvoiceService _invoiceService;
         private readonly ConversationHistoryService _history;
         private readonly ILogger<VendorAgentService> _logger;
+        private readonly IMemoryCache _cache;
+
+        private static readonly TimeSpan SystemPromptTtl = TimeSpan.FromMinutes(3);
 
         public VendorAgentService(
             IConfiguration configuration,
             InvoiceService invoiceService,
             ConversationHistoryService history,
-            ILogger<VendorAgentService> logger)
+            ILogger<VendorAgentService> logger,
+            IMemoryCache cache)
         {
             _configuration = configuration;
             _invoiceService = invoiceService;
             _history = history;
             _logger = logger;
+            _cache = cache;
         }
 
-        // ── Tool definitions exposed to the model ────────────────────────────
+        // ── Tool definitions ─────────────────────────────────────────────────
+
+        private static readonly ChatTool ShowMenuTool = ChatTool.CreateFunctionTool(
+            functionName: "show_menu",
+            functionDescription: "Show the interactive WhatsApp options menu to the vendor. Call this ONLY when the vendor greets you or starts a new conversation with no specific question. Do NOT call this for invoice queries — answer those directly.",
+            functionParameters: BinaryData.FromString("""{"type":"object","properties":{}}"""));
+
         private static readonly ChatTool GetInvoiceDetailsTool = ChatTool.CreateFunctionTool(
             functionName: "get_invoice_details",
             functionDescription: "Fetch the full details of ONE specific invoice the vendor owns: amounts, dates, payment info, rejection reason, and the full approval chain (approver names, emails, levels, status, action dates). Call this once you know exactly which invoice the vendor means.",
@@ -51,7 +62,7 @@ namespace VendorInvoiceAssistant.Services
 
         private static readonly ChatTool EscalateToApTool = ChatTool.CreateFunctionTool(
             functionName: "escalate_to_ap",
-            functionDescription: "Route the request to the human Accounts Payable team (Human-in-the-Loop). Use this for sensitive actions you must NOT perform yourself (e.g. changing bank account details), policy/legal questions you cannot answer reliably (e.g. penalty interest rates), or genuine disputes the vendor wants logged. This records the request for a human to follow up.",
+            functionDescription: "Route the request to the human Accounts Payable team (Human-in-the-Loop). Use this for sensitive actions you must NOT perform yourself (e.g. changing bank account details), policy/legal questions you cannot answer reliably (e.g. penalty interest rates), or genuine disputes the vendor wants logged.",
             functionParameters: BinaryData.FromString("""
             {
               "type": "object",
@@ -69,35 +80,35 @@ namespace VendorInvoiceAssistant.Services
             }
             """));
 
-        /// <summary>
-        /// Runs the agentic loop for one inbound vendor message and returns the assistant reply.
-        /// Also persists both the inbound and outbound turns to conversation history.
-        /// </summary>
-        public async Task<string> RespondAsync(string phoneNumber, string userMessage, string sessionId)
+        // ── Main entry point ─────────────────────────────────────────────────
+
+        public async Task<AgentResponse> RespondAsync(string phoneNumber, string userMessage, string sessionId)
         {
             var vendor = await _invoiceService.GetVendorByPhone(phoneNumber);
             if (vendor == null)
-                return "I'm sorry, I couldn't find a vendor account linked to this number. Please contact the AP team to get set up.";
+                return new AgentResponse { Text = "I'm sorry, I couldn't find a vendor account linked to this number. Please contact the AP team to get set up." };
 
             var snapshots = await _invoiceService.GetInvoiceSnapshots(phoneNumber);
             var historyTurns = await _history.GetRecentTurns(vendor.VendorId);
 
-            // Log the inbound turn before we answer, so it's part of history if anything fails later.
             await _history.LogTurn(vendor.VendorId, "Inbound", userMessage, sessionId);
 
             var client = CreateChatClient();
 
-            var messages = new List<ChatMessage>
+            var cacheKey = $"sysprompt:{vendor.VendorId}";
+            var systemPrompt = _cache.GetOrCreate(cacheKey, entry =>
             {
-                new SystemChatMessage(BuildSystemPrompt(vendor, snapshots))
-            };
+                entry.AbsoluteExpirationRelativeToNow = SystemPromptTtl;
+                return BuildSystemPrompt(vendor, snapshots);
+            }) ?? BuildSystemPrompt(vendor, snapshots);
 
-            // Replay prior turns so multi-turn clarification works.
+            var messages = new List<ChatMessage> { new SystemChatMessage(systemPrompt) };
+
             foreach (var turn in historyTurns)
             {
                 if (turn.Direction == "Inbound")
                     messages.Add(new UserChatMessage(turn.MessageText));
-                else
+                else if (turn.Direction == "Outbound")
                     messages.Add(new AssistantChatMessage(turn.MessageText));
             }
 
@@ -105,11 +116,10 @@ namespace VendorInvoiceAssistant.Services
 
             var options = new ChatCompletionOptions
             {
-                Tools = { GetInvoiceDetailsTool, EscalateToApTool },
+                Tools = { ShowMenuTool, GetInvoiceDetailsTool, EscalateToApTool },
                 Temperature = 0.2f
             };
 
-            // Agentic loop: keep resolving tool calls until the model produces a final answer.
             const int maxIterations = 5;
             string finalReply = "I'm sorry, I couldn't process that. Could you please rephrase?";
             int? relatedInvoiceId = null;
@@ -120,29 +130,44 @@ namespace VendorInvoiceAssistant.Services
 
                 if (completion.FinishReason == ChatFinishReason.ToolCalls)
                 {
-                    // The model must see its own tool-call request echoed back before the results.
                     messages.Add(new AssistantChatMessage(completion));
 
+                    bool showMenu = false;
                     foreach (var toolCall in completion.ToolCalls)
                     {
+                        if (toolCall.FunctionName == "show_menu")
+                        {
+                            showMenu = true;
+                            // Add a synthetic result so the model state stays valid if we ever continue.
+                            messages.Add(new ToolChatMessage(toolCall.Id, "{\"status\":\"menu_shown\"}"));
+                            continue;
+                        }
+
                         var (result, invoiceId) = await ExecuteTool(toolCall, phoneNumber, vendor, sessionId);
                         if (invoiceId.HasValue) relatedInvoiceId = invoiceId;
                         messages.Add(new ToolChatMessage(toolCall.Id, result));
                     }
 
-                    continue; // let the model use the tool results
+                    // Return immediately when show_menu is called — the interactive list IS the response.
+                    if (showMenu)
+                    {
+                        await _history.LogTurn(vendor.VendorId, "Outbound", "[MENU_SHOWN]", sessionId);
+                        return new AgentResponse { ShowMenu = true };
+                    }
+
+                    continue;
                 }
 
-                // Normal completion — we have the final text.
                 finalReply = completion.Content.Count > 0 ? completion.Content[0].Text : finalReply;
                 break;
             }
 
             await _history.LogTurn(vendor.VendorId, "Outbound", finalReply, sessionId, relatedInvoiceId);
-            return finalReply;
+            return new AgentResponse { Text = finalReply };
         }
 
         // ── Tool execution ───────────────────────────────────────────────────
+
         private async Task<(string result, int? relatedInvoiceId)> ExecuteTool(
             ChatToolCall toolCall, string phoneNumber, Vendor vendor, string sessionId)
         {
@@ -158,9 +183,7 @@ namespace VendorInvoiceAssistant.Services
                         var inv = await _invoiceService.GetFullInvoiceForVendor(phoneNumber, invoiceNumber);
 
                         if (inv == null)
-                        {
                             return ($"{{\"error\":\"Invoice {invoiceNumber} not found for this vendor account.\"}}", null);
-                        }
 
                         return (SerializeInvoice(inv), inv.InvoiceId);
                     }
@@ -186,7 +209,8 @@ namespace VendorInvoiceAssistant.Services
                             sessionId,
                             relatedInvoiceId);
 
-                        _logger.LogInformation("Escalated to AP — Vendor {VendorId}, Reason: {Reason}", vendor.VendorId, reason);
+                        if (_logger.IsEnabled(LogLevel.Information))
+                            _logger.LogInformation("Escalated to AP — Vendor {VendorId}, Reason: {Reason}", vendor.VendorId, reason);
                         return ("{\"status\":\"escalated\",\"message\":\"Request logged for the AP team to follow up.\"}", relatedInvoiceId);
                     }
 
@@ -201,10 +225,32 @@ namespace VendorInvoiceAssistant.Services
             }
         }
 
-        // ── Prompt building ────────────────────────────────────────────────────
+        // ── Prompt building ──────────────────────────────────────────────────
+
+        private static readonly HashSet<string> ActiveStatuses = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Pending", "Under Review", "Approved", "Rejected", "On Hold", "Processing"
+        };
+
+        private static int EstimateTokens(string text) => text.Length / 4;
+
+        private static string FormatSnapshotLine(InvoiceSnapshot s)
+        {
+            var sb = new StringBuilder();
+            sb.Append($"- {s.InvoiceNumber}");
+            if (!string.IsNullOrWhiteSpace(s.PONumber)) sb.Append($" (PO: {s.PONumber})");
+            sb.Append($" | {s.Status}");
+            sb.Append($" | {s.CurrencyCode} {s.InvoiceAmount:N2}");
+            sb.Append($" | Invoice date: {s.InvoiceDate:dd MMM yyyy}");
+            if (s.DueDate.HasValue) sb.Append($" | Due: {s.DueDate.Value:dd MMM yyyy}");
+            if (!string.IsNullOrWhiteSpace(s.InvoiceType)) sb.Append($" | Type: {s.InvoiceType}");
+            if (!string.IsNullOrWhiteSpace(s.Remarks)) sb.Append($" | Remarks: {s.Remarks}");
+            return sb.ToString();
+        }
+
         private string BuildSystemPrompt(Vendor vendor, List<InvoiceSnapshot> snapshots)
         {
-            var today = _configuration["Assistant:Today"]; // optional override for testing
+            var today = _configuration["Assistant:Today"];
             var todayLine = string.IsNullOrWhiteSpace(today)
                 ? $"Today's date is {DateTime.UtcNow:dd MMM yyyy}."
                 : $"Today's date is {today}.";
@@ -216,19 +262,46 @@ namespace VendorInvoiceAssistant.Services
             }
             else
             {
-                sb.AppendLine($"This vendor has {snapshots.Count} invoice(s). Summary (most recent first):");
-                foreach (var s in snapshots)
+                const int snapshotTokenBudget = 2000;
+
+                var active = snapshots.Where(s => ActiveStatuses.Contains(s.Status ?? "")).ToList();
+                var inactive = snapshots.Where(s => !ActiveStatuses.Contains(s.Status ?? "")).ToList();
+
+                var lines = new List<string>();
+                int tokensSoFar = 0;
+                int truncatedCount = 0;
+
+                foreach (var s in active)
                 {
-                    sb.Append($"- {s.InvoiceNumber}");
-                    if (!string.IsNullOrWhiteSpace(s.PONumber)) sb.Append($" (PO: {s.PONumber})");
-                    sb.Append($" | {s.Status}");
-                    sb.Append($" | {s.CurrencyCode} {s.InvoiceAmount:N2}");
-                    sb.Append($" | Invoice date: {s.InvoiceDate:dd MMM yyyy}");
-                    if (s.DueDate.HasValue) sb.Append($" | Due: {s.DueDate.Value:dd MMM yyyy}");
-                    if (!string.IsNullOrWhiteSpace(s.InvoiceType)) sb.Append($" | Type: {s.InvoiceType}");
-                    if (!string.IsNullOrWhiteSpace(s.Remarks)) sb.Append($" | Remarks: {s.Remarks}");
-                    sb.AppendLine();
+                    var line = FormatSnapshotLine(s);
+                    lines.Add(line);
+                    tokensSoFar += EstimateTokens(line);
                 }
+
+                foreach (var s in inactive)
+                {
+                    var line = FormatSnapshotLine(s);
+                    if (tokensSoFar + EstimateTokens(line) <= snapshotTokenBudget)
+                    {
+                        lines.Add(line);
+                        tokensSoFar += EstimateTokens(line);
+                    }
+                    else
+                    {
+                        truncatedCount++;
+                    }
+                }
+
+                sb.AppendLine($"This vendor has {snapshots.Count} invoice(s). Summary (most recent first):");
+                foreach (var line in lines)
+                    sb.AppendLine(line);
+
+                if (truncatedCount > 0)
+                    sb.AppendLine($"+ {truncatedCount} older paid invoice(s) not shown (use get_invoice_details if the vendor asks about one by number).");
+
+                if (truncatedCount > 0 && _logger.IsEnabled(LogLevel.Information))
+                    _logger.LogInformation("Snapshot truncated: {Shown} shown, {Hidden} hidden for vendor {VendorId}",
+                        lines.Count, truncatedCount, vendor.VendorId);
             }
 
             return $$"""
@@ -243,38 +316,37 @@ namespace VendorInvoiceAssistant.Services
 
                 {{sb}}
 
+                ## Interactive menu option IDs
+                The vendor may send one of these short IDs when they tap a button on the WhatsApp menu.
+                Treat each as the corresponding intent — do NOT show the menu again for these:
+                - invoice_status       → vendor wants status of a specific invoice
+                - payment_date         → vendor wants payment / due date information
+                - outstanding_invoices → vendor wants to see pending or overdue invoices
+                - rejected_invoices    → vendor wants to see rejected or on-hold invoices
+                - approval_status      → vendor wants the approval chain status
+                - raise_dispute        → vendor wants to raise a dispute or query
+                - talk_to_ap           → vendor wants to speak to the AP team (use escalate_to_ap)
+
                 ## How to behave
-                1. RESOLVE THE INVOICE FIRST. The vendor may refer to an invoice by number, PO number, month
-                   ("my January invoice"), amount ("my 1.5 lakh invoice"), type ("my managed services invoice"),
-                   or "latest". Match against the snapshot above.
-                2. ASK FOR CLARIFICATION when genuinely ambiguous:
-                   - If MORE THAN ONE invoice matches (e.g. "my invoice" with 3 invoices, or several share the
-                     same amount/type), list the candidates and ask which one. Be specific — show invoice numbers
-                     with a distinguishing detail (amount, date, or status).
-                   - If exactly one invoice matches, do NOT ask — proceed and confirm naturally in your answer.
-                   - If the intent is unclear ("tell me about INV-X"), you may give a concise full summary OR ask
-                     what they'd like (status, payment date, or approval details). Prefer a helpful summary.
-                3. MULTI-INTENT: if the vendor asks for several things in one message (e.g. status of all invoices
-                   AND total pending), answer ALL of them in one clear, structured reply. Call get_invoice_details
-                   for each invoice you need.
-                4. IMPLICIT / STATEMENT-STYLE messages ("my invoice is stuck for a month", "I haven't received
-                   payment for my January invoice"): infer the intent. Verify against the data BEFORE escalating —
-                   if records show it WAS paid, share the proof (amount, date, payment reference) and suggest they
-                   check their bank instead of escalating.
-                5. ESCALATE via the escalate_to_ap tool for:
-                   - Sensitive changes you must never perform yourself (e.g. updating bank account / IFSC details).
-                   - Policy or legal questions not answerable from invoice data (e.g. penalty interest rates).
-                   - Genuine disputes the vendor wants logged.
-                   After escalating, tell the vendor you've routed it to the AP team.
-                6. STRICT DATA BOUNDARY: You can ONLY see and discuss invoices that appear in the snapshot above.
-                   If an invoice number the vendor mentions is NOT in the snapshot, simply say you cannot find
-                   that invoice on their account — do NOT suggest PO numbers, invoice numbers, or any data from
-                   other accounts. Never invent or cross-reference data outside the snapshot.
+                1. GREETINGS: Call show_menu ONLY when the vendor sends a greeting (hi, hello, good morning, etc.)
+                   with no specific question. For all other messages, answer directly.
+                2. RESOLVE THE INVOICE FIRST. The vendor may refer to an invoice by number, PO number, month
+                   ("my January invoice"), amount ("my 1.5 lakh invoice"), type, or "latest". Match the snapshot.
+                3. ASK FOR CLARIFICATION only when genuinely ambiguous — multiple invoices match with no
+                   distinguishing detail. List candidates with a key detail (amount, date, status) and ask.
+                   If exactly one matches, proceed without asking.
+                4. MULTI-INTENT: answer ALL intents in one structured reply. Call get_invoice_details per invoice.
+                5. IMPLICIT STATEMENTS ("my invoice is stuck for a month"): infer intent. Check data before
+                   escalating — if records show it was paid, share the proof and suggest they check their bank.
+                6. ESCALATE via escalate_to_ap for: sensitive changes (bank/IFSC updates), policy/legal questions,
+                   genuine disputes. After escalating, tell the vendor it's routed to the AP team.
+                7. STRICT DATA BOUNDARY: only discuss invoices in the snapshot above. If an invoice the vendor
+                   mentions is not listed, say you can't find it — never invent data or reference other accounts.
 
                 ## Style
                 - Concise and warm. Use WhatsApp formatting (*bold* for key values). Indian number formatting and
-                  the ₹ symbol for INR amounts. Keep replies short — a few lines, not essays.
-                - When you state a fact (a date, amount, approver), it must come from the snapshot or a tool result.
+                  ₹ symbol for INR. Keep replies short — a few lines, not essays.
+                - Every fact (date, amount, approver) must come from the snapshot or a tool result.
                 """;
         }
 

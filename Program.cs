@@ -10,12 +10,11 @@ namespace VendorInvoiceAssistant
         {
             var builder = WebApplication.CreateBuilder(args);
 
+            builder.Services.AddMemoryCache();
             builder.Services.AddControllers();
-            builder.Services.AddScoped<VendorInvoiceAssistant.Services.AiService>();
             builder.Services.AddScoped<VendorInvoiceAssistant.Services.InvoiceService>();
             builder.Services.AddScoped<VendorInvoiceAssistant.Services.ConversationHistoryService>();
             builder.Services.AddScoped<VendorInvoiceAssistant.Services.VendorAgentService>();
-            builder.Services.AddScoped<VendorInvoiceAssistant.Services.ChatService>();
             builder.Services.AddHttpClient<VendorInvoiceAssistant.Services.WhatsAppService>();
             builder.Services.AddDbContext<AppDbContext>(options =>
                 options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
@@ -39,6 +38,8 @@ namespace VendorInvoiceAssistant
                 options.Title = "Vendor Invoice Assistant";
                 options.Theme = ScalarTheme.DeepSpace;
             });
+
+            app.MapGet("/", () => Results.Redirect("/scalar/v1"));
 
             app.UseHttpsRedirection();
 
