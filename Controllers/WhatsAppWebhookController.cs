@@ -48,10 +48,7 @@ namespace VendorInvoiceAssistant.Controllers
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
         public async Task<IActionResult> Receive([FromBody] JsonElement payload)
         {
-            var value = payload
-                .GetProperty("entry")[0]
-                .GetProperty("changes")[0]
-                .GetProperty("value");
+            var value = payload.GetProperty("entry")[0].GetProperty("changes")[0].GetProperty("value");
 
             if (!value.TryGetProperty("messages", out var messages) || messages.GetArrayLength() == 0)
                 return Ok();
@@ -82,8 +79,7 @@ namespace VendorInvoiceAssistant.Controllers
 
             var (replyText, sendInteractiveList, invoicesForSelection) = await _chatService.ProcessMessage(phoneNumber, userMessage);
 
-            _logger.LogInformation("Phone: {Phone} | Message: {Msg} | sendInteractiveList: {Flag} | invoiceList: {InvCount} | Reply: {Reply}",
-                phoneNumber, userMessage, sendInteractiveList, invoicesForSelection?.Count ?? 0, replyText);
+            _logger.LogInformation("Phone: {Phone} | Message: {Msg} | sendInteractiveList: {Flag} | invoiceList: {InvCount} | Reply: {Reply}",phoneNumber, userMessage, sendInteractiveList, invoicesForSelection?.Count ?? 0, replyText);
 
             if (invoicesForSelection != null)
                 await _whatsAppService.SendInvoiceSelectionList(phoneNumber, invoicesForSelection);

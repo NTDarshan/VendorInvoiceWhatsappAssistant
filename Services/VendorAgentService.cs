@@ -159,11 +159,7 @@ namespace VendorInvoiceAssistant.Services
 
                         if (inv == null)
                         {
-                            var anyInvoice = await _invoiceService.FindInvoiceByNumber(invoiceNumber);
-                            if (anyInvoice == null)
-                                return ($"{{\"error\":\"Invoice {invoiceNumber} not found in the system.\"}}", null);
-
-                            return ($"{{\"error\":\"Invoice {invoiceNumber} exists but is NOT linked to this vendor account.\"}}", null);
+                            return ($"{{\"error\":\"Invoice {invoiceNumber} not found for this vendor account.\"}}", null);
                         }
 
                         return (SerializeInvoice(inv), inv.InvoiceId);
@@ -270,8 +266,10 @@ namespace VendorInvoiceAssistant.Services
                    - Policy or legal questions not answerable from invoice data (e.g. penalty interest rates).
                    - Genuine disputes the vendor wants logged.
                    After escalating, tell the vendor you've routed it to the AP team.
-                6. STAY IN SCOPE: only discuss this vendor's invoices and AP matters. Never reveal another vendor's
-                   data. Never invent values not present in the data.
+                6. STRICT DATA BOUNDARY: You can ONLY see and discuss invoices that appear in the snapshot above.
+                   If an invoice number the vendor mentions is NOT in the snapshot, simply say you cannot find
+                   that invoice on their account — do NOT suggest PO numbers, invoice numbers, or any data from
+                   other accounts. Never invent or cross-reference data outside the snapshot.
 
                 ## Style
                 - Concise and warm. Use WhatsApp formatting (*bold* for key values). Indian number formatting and
