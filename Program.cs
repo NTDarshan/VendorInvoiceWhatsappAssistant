@@ -14,6 +14,7 @@ namespace VendorInvoiceAssistant
             builder.Services.AddControllers();
             builder.Services.AddScoped<VendorInvoiceAssistant.Services.InvoiceService>();
             builder.Services.AddScoped<VendorInvoiceAssistant.Services.ConversationHistoryService>();
+            builder.Services.AddScoped<VendorInvoiceAssistant.Services.EmailService>();
             builder.Services.AddScoped<VendorInvoiceAssistant.Services.VendorAgentService>();
             builder.Services.AddHttpClient<VendorInvoiceAssistant.Services.WhatsAppService>();
             builder.Services.AddDbContext<AppDbContext>(options =>

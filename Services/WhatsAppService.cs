@@ -17,6 +17,65 @@ public class WhatsAppService
         _logger = logger;
     }
 
+    // Marks the message as read AND shows the typing indicator in one API call.
+    // Meta's official payload: status=read + typing_indicator={ type="text" }
+    public async Task MarkAsReadWithTypingAsync(string messageId)
+    {
+        var token = _configuration["WhatsApp:AccessToken"];
+        var phoneNumberId = _configuration["WhatsApp:PhoneNumberId"];
+        var url = $"https://graph.facebook.com/v23.0/{phoneNumberId}/messages";
+
+        var payload = new
+        {
+            messaging_product = "whatsapp",
+            status = "read",
+            message_id = messageId,
+            typing_indicator = new { type = "text" }
+        };
+
+        var request = new HttpRequestMessage(HttpMethod.Post, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await _httpClient.SendAsync(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync();
+            _logger.LogError("MarkAsReadWithTyping failed {StatusCode}: {Body}", (int)response.StatusCode, body);
+        }
+    }
+
+    public async Task SendTypingIndicatorAsync(string phoneNumber)
+    {
+        var token = _configuration["WhatsApp:AccessToken"];
+        var phoneNumberId = _configuration["WhatsApp:PhoneNumberId"];
+        var url = $"https://graph.facebook.com/v23.0/{phoneNumberId}/messages";
+
+        var payload = new
+        {
+            messaging_product = "whatsapp",
+            to = phoneNumber,
+            typing_indicator = new { type = "text" }
+        };
+
+        var request = new HttpRequestMessage(HttpMethod.Post, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await _httpClient.SendAsync(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync();
+            _logger.LogError("SendTypingIndicator failed {StatusCode}: {Body}", (int)response.StatusCode, body);
+        }
+    }
+
     public async Task SendMessage(string phoneNumber, string message)
     {
         var token = _configuration["WhatsApp:AccessToken"];
@@ -48,7 +107,7 @@ public class WhatsAppService
         }
     }
 
-    public async Task SendInteractiveList(string phoneNumber)
+    public async Task SendInteractiveList(string phoneNumber, string vendorName = "Vendor")
     {
         var token = _configuration["WhatsApp:AccessToken"];
         var phoneNumberId = _configuration["WhatsApp:PhoneNumberId"];
@@ -62,7 +121,7 @@ public class WhatsAppService
             interactive = new
             {
                 type = "list",
-                header = new { type = "text", text = "Hello, Infosys BPM! How can I help you today?" },
+                header = new { type = "text", text = $"Hello, {vendorName}! How can I help you today?" },
                 body = new { text = "Please choose an option:" },
                 footer = new { text = "Powered by Acronotics" },
                 action = new

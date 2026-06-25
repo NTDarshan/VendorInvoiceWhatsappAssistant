@@ -18,21 +18,30 @@ namespace VendorInvoiceAssistant.Services
         private readonly IConfiguration _configuration;
         private readonly InvoiceService _invoiceService;
         private readonly ConversationHistoryService _history;
+        private readonly EmailService _emailService;
         private readonly ILogger<VendorAgentService> _logger;
         private readonly IMemoryCache _cache;
 
         private static readonly TimeSpan SystemPromptTtl = TimeSpan.FromMinutes(3);
 
+        // Statuses where an invoice can be held up by an unapproved approver
+        private static readonly HashSet<string> DelayableStatuses = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Pending Approval", "Rejected and On Hold"
+        };
+
         public VendorAgentService(
             IConfiguration configuration,
             InvoiceService invoiceService,
             ConversationHistoryService history,
+            EmailService emailService,
             ILogger<VendorAgentService> logger,
             IMemoryCache cache)
         {
             _configuration = configuration;
             _invoiceService = invoiceService;
             _history = history;
+            _emailService = emailService;
             _logger = logger;
             _cache = cache;
         }
@@ -185,7 +194,8 @@ namespace VendorInvoiceAssistant.Services
                         if (inv == null)
                             return ($"{{\"error\":\"Invoice {invoiceNumber} not found for this vendor account.\"}}", null);
 
-                        return (SerializeInvoice(inv), inv.InvoiceId);
+                        var notifiedApprovers = await NotifyPendingApproversAsync(inv, vendor.VendorName);
+                        return (SerializeInvoice(inv, notifiedApprovers), inv.InvoiceId);
                     }
 
                     case "escalate_to_ap":
@@ -229,7 +239,7 @@ namespace VendorInvoiceAssistant.Services
 
         private static readonly HashSet<string> ActiveStatuses = new(StringComparer.OrdinalIgnoreCase)
         {
-            "Pending", "Under Review", "Approved", "Rejected", "On Hold", "Processing"
+            "Pending Approval", "Approved", "Rejected", "Rejected and On Hold"
         };
 
         private static int EstimateTokens(string text) => text.Length / 4;
@@ -321,8 +331,8 @@ namespace VendorInvoiceAssistant.Services
                 Treat each as the corresponding intent — do NOT show the menu again for these:
                 - invoice_status       → vendor wants status of a specific invoice
                 - payment_date         → vendor wants payment / due date information
-                - outstanding_invoices → vendor wants to see pending or overdue invoices
-                - rejected_invoices    → vendor wants to see rejected or on-hold invoices
+                - outstanding_invoices → vendor wants to see ALL pending or overdue invoices. Immediately list every invoice from the snapshot whose status is "Pending Approval", "Approved" (not yet paid), or any non-paid/non-cancelled status. Do NOT ask for an invoice number — scan the snapshot and reply with the list directly.
+                - rejected_invoices    → vendor wants to see rejected or on-hold invoices. Immediately list every invoice from the snapshot whose status is "Rejected" or "Rejected and On Hold". Do NOT ask for an invoice number.
                 - approval_status      → vendor wants the approval chain status
                 - raise_dispute        → vendor wants to raise a dispute or query
                 - talk_to_ap           → vendor wants to speak to the AP team (use escalate_to_ap)
@@ -350,7 +360,80 @@ namespace VendorInvoiceAssistant.Services
                 """;
         }
 
-        private static string SerializeInvoice(InvoiceDetails inv)
+        /// <summary>
+        /// Sends approval reminder emails to any approver whose status is "Pending"
+        /// when the invoice itself is in a delayable status (Pending/Under Review/On Hold).
+        /// Returns the names of approvers who were actually emailed this call.
+        /// </summary>
+        private async Task<List<string>> NotifyPendingApproversAsync(InvoiceDetails inv, string vendorName)
+        {
+            _logger.LogInformation("[Notify] Checking invoice {Invoice} — Status: '{Status}', Approvals: {Count}",
+                inv.InvoiceNumber, inv.InvoiceStatus, inv.Approvals.Count);
+
+            if (!DelayableStatuses.Contains(inv.InvoiceStatus))
+            {
+                _logger.LogInformation("[Notify] Skipping — invoice status '{Status}' is not in delayable set ({Delayable})",
+                    inv.InvoiceStatus, string.Join(", ", DelayableStatuses));
+                return [];
+            }
+
+            // Log the full approval chain so you can see every approver and their status
+            foreach (var a in inv.Approvals)
+            {
+                _logger.LogInformation("[Notify] Approval chain — Level {Level}: {Name} <{Email}> | Status: '{Status}' | ActionDate: {Date}",
+                    a.Level, a.ApproverName, a.ApproverEmail, a.Status,
+                    a.ActionDate?.ToString("yyyy-MM-dd") ?? "—");
+            }
+
+            var pendingApprovers = inv.Approvals
+                .Where(a => string.Equals(a.Status, "Pending", StringComparison.OrdinalIgnoreCase)
+                         && !string.IsNullOrWhiteSpace(a.ApproverEmail))
+                .ToList();
+
+            if (pendingApprovers.Count == 0)
+            {
+                _logger.LogInformation("[Notify] No pending approvers found for invoice {Invoice}", inv.InvoiceNumber);
+                return [];
+            }
+
+            _logger.LogInformation("[Notify] Found {Count} pending approver(s) for invoice {Invoice} — will attempt email",
+                pendingApprovers.Count, inv.InvoiceNumber);
+
+            var notified = new List<string>();
+            foreach (var approver in pendingApprovers)
+            {
+                _logger.LogInformation("[Notify] Sending reminder to Level {Level}: {Name} <{Email}>",
+                    approver.Level, approver.ApproverName, approver.ApproverEmail);
+
+                var sent = await _emailService.SendApprovalReminderAsync(
+                    approver.ApproverName,
+                    approver.ApproverEmail,
+                    inv.InvoiceNumber,
+                    vendorName,
+                    inv.InvoiceAmount,
+                    inv.CurrencyCode,
+                    inv.InvoiceDate,
+                    inv.DueDate);
+
+                if (sent)
+                {
+                    notified.Add(approver.ApproverName);
+                    _logger.LogInformation("[Notify] Email sent successfully to {Name}", approver.ApproverName);
+                }
+                else
+                {
+                    _logger.LogWarning("[Notify] Email was NOT sent to {Name} <{Email}> — check [Email] logs above for reason",
+                        approver.ApproverName, approver.ApproverEmail);
+                }
+            }
+
+            _logger.LogInformation("[Notify] Done — notified {Sent}/{Total} approver(s) for invoice {Invoice}",
+                notified.Count, pendingApprovers.Count, inv.InvoiceNumber);
+
+            return notified;
+        }
+
+        private static string SerializeInvoice(InvoiceDetails inv, List<string>? notifiedApprovers = null)
         {
             var payload = new
             {
@@ -382,7 +465,10 @@ namespace VendorInvoiceAssistant.Services
                     status = a.Status,
                     actionDate = a.ActionDate?.ToString("yyyy-MM-dd"),
                     comments = a.Comments
-                })
+                }),
+                remindersSent = notifiedApprovers != null && notifiedApprovers.Count > 0
+                    ? $"Approval reminder emails were automatically sent to: {string.Join(", ", notifiedApprovers)}. Inform the vendor that a reminder has been sent to the pending approver(s)."
+                    : (string?)null
             };
 
             return JsonSerializer.Serialize(payload);
